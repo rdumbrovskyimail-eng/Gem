@@ -25,6 +25,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AddComment
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.ArrowDropUp
@@ -35,9 +36,13 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.RecordVoiceOver
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -65,6 +70,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -73,6 +79,8 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import android.media.MediaPlayer
+import android.net.Uri as AndroidUri
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -172,6 +180,38 @@ data class Attachment(
     val mimeType: String
 )
 
+// ----- Forvo API models -----
+
+@Serializable
+data class ForvoResponse(
+    val attributes: ForvoAttributes? = null,
+    val items: List<ForvoItem> = emptyList()
+)
+
+@Serializable
+data class ForvoAttributes(
+    val total: Int = 0
+)
+
+@Serializable
+data class ForvoItem(
+    val id: Long = 0,
+    val word: String = "",
+    val original: String = "",
+    val username: String = "",
+    val sex: String? = null,
+    val country: String? = null,
+    val code: String? = null,
+    val langname: String? = null,
+    val pathmp3: String? = null,
+    val pathogg: String? = null,
+    val rate: Int? = null,
+    @SerialName("num_votes") val numVotes: Int? = null,
+    @SerialName("num_positive_votes") val numPositiveVotes: Int? = null,
+    val hits: Long? = null,
+    val addtime: String? = null
+)
+
 // ====================================================================
 // 2. Settings & Storage (Encrypted API keys + JSON history)
 // ====================================================================
@@ -213,6 +253,12 @@ class SettingsStorage @Inject constructor(@ApplicationContext context: Context) 
     fun getActiveKey(): String {
         val idx = getActiveIndex()
         return prefs.getString("api_key_$idx", "") ?: ""
+    }
+
+    fun getForvoKey(): String = prefs.getString("forvo_api_key", "") ?: ""
+
+    fun saveForvoKey(key: String) {
+        prefs.edit().putString("forvo_api_key", key.trim()).apply()
     }
 }
 
@@ -473,6 +519,12 @@ class ChatViewModel @Inject constructor(
         settingsStorage.saveKeys(keys)
     }
 
+    fun getForvoKey(): String = settingsStorage.getForvoKey()
+
+    fun saveForvoKey(key: String) {
+        settingsStorage.saveForvoKey(key)
+    }
+
     fun stopGeneration() {
         activeCall?.cancel()
         activeCall = null
@@ -647,6 +699,120 @@ class ChatViewModel @Inject constructor(
 }
 
 // ====================================================================
+// 4b. Forvo API (pronunciations, German only)
+// ====================================================================
+
+@Singleton
+class ForvoService @Inject constructor(
+    private val client: OkHttpClient,
+    private val settings: SettingsStorage
+) {
+    private val json = Json {
+        ignoreUnknownKeys = true
+        explicitNulls = false
+    }
+
+    suspend fun search(word: String): Result<List<ForvoItem>> = withContext(Dispatchers.IO) {
+        val key = settings.getForvoKey()
+        if (key.isBlank()) {
+            return@withContext Result.failure(IllegalStateException("Forvo API-ключ не задан. Откройте настройки."))
+        }
+        val cleanWord = word.trim()
+        if (cleanWord.isEmpty()) {
+            return@withContext Result.failure(IllegalArgumentException("Пустое слово."))
+        }
+        val encoded = AndroidUri.encode(cleanWord)
+        val url = "https://apifree.forvo.com/key/$key/format/json/" +
+                "action/word-pronunciations/word/$encoded/language/de"
+
+        try {
+            val req = Request.Builder()
+                .url(url)
+                .get()
+                .addHeader("Accept", "application/json")
+                .build()
+            client.newCall(req).execute().use { response ->
+                val body = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(
+                        IOException("HTTP ${response.code}: ${body.take(300)}")
+                    )
+                }
+                val parsed = try {
+                    json.decodeFromString<ForvoResponse>(body)
+                } catch (e: Exception) {
+                    // Forvo при кривом ключе/превышении лимита может вернуть HTML/иную структуру.
+                    return@withContext Result.failure(
+                        IOException("Не удалось разобрать ответ Forvo: ${e.localizedMessage ?: body.take(120)}")
+                    )
+                }
+                Result.success(parsed.items)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+}
+
+@HiltViewModel
+class ForvoViewModel @Inject constructor(
+    private val service: ForvoService,
+    private val settings: SettingsStorage
+) : ViewModel() {
+
+    var query by mutableStateOf("")
+    var results by mutableStateOf<List<ForvoItem>>(emptyList())
+        private set
+    var isLoading by mutableStateOf(false)
+        private set
+    var error by mutableStateOf<String?>(null)
+        private set
+    var apiKey by mutableStateOf(settings.getForvoKey())
+        private set
+
+    fun updateQuery(value: String) {
+        query = value
+    }
+
+    fun saveApiKey(value: String) {
+        settings.saveForvoKey(value)
+        apiKey = value.trim()
+    }
+
+    fun search() {
+        val q = query.trim()
+        if (q.isBlank()) {
+            error = "Введите немецкое слово"
+            return
+        }
+        if (settings.getForvoKey().isBlank()) {
+            error = "Сначала укажите Forvo API-ключ в настройках."
+            return
+        }
+        isLoading = true
+        error = null
+        viewModelScope.launch {
+            service.search(q)
+                .onSuccess { items ->
+                    results = items
+                    error = if (items.isEmpty()) "Ничего не найдено для «$q»" else null
+                }
+                .onFailure { ex ->
+                    results = emptyList()
+                    error = ex.localizedMessage ?: ex.javaClass.simpleName
+                }
+            isLoading = false
+        }
+    }
+
+    fun clear() {
+        results = emptyList()
+        error = null
+        query = ""
+    }
+}
+
+// ====================================================================
 // 5. DI module
 // ====================================================================
 
@@ -686,8 +852,14 @@ fun ChatAppMainScreen(viewModel: ChatViewModel = hiltViewModel()) {
     val context = LocalContext.current
     var showSettings by remember { mutableStateOf(false) }
     var showSessionsDrawer by remember { mutableStateOf(false) }
+    var showForvo by remember { mutableStateOf(false) }
     var promptText by remember { mutableStateOf("") }
     var selectedAttachment by remember { mutableStateOf<Attachment?>(null) }
+
+    if (showForvo) {
+        ForvoScreen(onBack = { showForvo = false })
+        return
+    }
 
     val activeSession = viewModel.currentSession
     val listState = rememberLazyListState()
@@ -736,6 +908,13 @@ fun ChatAppMainScreen(viewModel: ChatViewModel = hiltViewModel()) {
                 actions = {
                     IconButton(onClick = { viewModel.createNewSession() }) {
                         Icon(Icons.Default.AddComment, contentDescription = "Новый диалог", tint = Color.Black)
+                    }
+                    IconButton(onClick = { showForvo = true }) {
+                        Icon(
+                            Icons.Default.RecordVoiceOver,
+                            contentDescription = "Forvo (произношение)",
+                            tint = Color.Black
+                        )
                     }
                     IconButton(onClick = { showSettings = true }) {
                         Icon(Icons.Default.Settings, contentDescription = "Настройки", tint = Color.Black)
@@ -871,8 +1050,12 @@ fun ChatAppMainScreen(viewModel: ChatViewModel = hiltViewModel()) {
     if (showSettings) {
         SettingsDialog(
             keys = viewModel.getKeys(),
+            forvoKey = viewModel.getForvoKey(),
             onDismiss = { showSettings = false },
-            onSave = { viewModel.saveKeys(it) }
+            onSave = { geminiKeys, forvoKey ->
+                viewModel.saveKeys(geminiKeys)
+                viewModel.saveForvoKey(forvoKey)
+            }
         )
     }
 
@@ -1182,8 +1365,14 @@ fun RenderMarkdownText(text: String, context: Context) {
 }
 
 @Composable
-fun SettingsDialog(keys: List<String>, onDismiss: () -> Unit, onSave: (List<String>) -> Unit) {
+fun SettingsDialog(
+    keys: List<String>,
+    forvoKey: String,
+    onDismiss: () -> Unit,
+    onSave: (geminiKeys: List<String>, forvoKey: String) -> Unit
+) {
     var tempKeys by remember { mutableStateOf(keys) }
+    var tempForvo by remember { mutableStateOf(forvoKey) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
@@ -1199,13 +1388,45 @@ fun SettingsDialog(keys: List<String>, onDismiss: () -> Unit, onSave: (List<Stri
                 modifier = Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+                item {
+                    Text(
+                        "Gemini API",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color.Gray,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 4.dp, bottom = 4.dp)
+                    )
+                }
                 items(9) { index ->
                     OutlinedTextField(
                         value = tempKeys.getOrNull(index).orEmpty(),
                         onValueChange = { newVal ->
                             tempKeys = tempKeys.toMutableList().also { it[index] = newVal }
                         },
-                        label = { Text("API-ключ ${index + 1}") },
+                        label = { Text("Gemini ключ ${index + 1}") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.Black,
+                            unfocusedTextColor = Color.Black,
+                            focusedBorderColor = Color.Black,
+                            unfocusedBorderColor = Color.Gray
+                        )
+                    )
+                }
+                item {
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                    Text(
+                        "Forvo API (произношение)",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color.Gray,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(bottom = 4.dp)
+                    )
+                    OutlinedTextField(
+                        value = tempForvo,
+                        onValueChange = { tempForvo = it },
+                        label = { Text("Forvo API-ключ") },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true,
                         colors = OutlinedTextFieldDefaults.colors(
@@ -1220,7 +1441,7 @@ fun SettingsDialog(keys: List<String>, onDismiss: () -> Unit, onSave: (List<Stri
         },
         confirmButton = {
             Button(
-                onClick = { onSave(tempKeys); onDismiss() },
+                onClick = { onSave(tempKeys, tempForvo); onDismiss() },
                 colors = ButtonDefaults.buttonColors(containerColor = Color.Black)
             ) {
                 Text("Сохранить", color = Color.White)
@@ -1270,4 +1491,301 @@ private fun copyToClipboard(context: Context, text: String) {
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     clipboard.setPrimaryClip(ClipData.newPlainText("Gemini Content", text))
     Toast.makeText(context, "Скопировано в буфер обмена", Toast.LENGTH_SHORT).show()
+}
+
+// ====================================================================
+// 8. Forvo Screen (German pronunciations)
+// ====================================================================
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ForvoScreen(
+    onBack: () -> Unit,
+    vm: ForvoViewModel = hiltViewModel()
+) {
+    val context = LocalContext.current
+    val mediaPlayer = remember { MediaPlayer() }
+    var playingId by remember { mutableStateOf<Long?>(null) }
+    var preparingId by remember { mutableStateOf<Long?>(null) }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            try {
+                mediaPlayer.reset()
+                mediaPlayer.release()
+            } catch (_: Exception) { /* ignore */ }
+        }
+    }
+
+    fun playItem(item: ForvoItem) {
+        val url = item.pathmp3?.takeIf { it.isNotBlank() }
+            ?: item.pathogg?.takeIf { it.isNotBlank() }
+            ?: run {
+                Toast.makeText(context, "Нет аудио для этого варианта", Toast.LENGTH_SHORT).show()
+                return
+            }
+        try {
+            mediaPlayer.reset()
+            mediaPlayer.setDataSource(url)
+            preparingId = item.id
+            playingId = null
+            mediaPlayer.setOnPreparedListener {
+                preparingId = null
+                playingId = item.id
+                it.start()
+            }
+            mediaPlayer.setOnCompletionListener {
+                playingId = null
+            }
+            mediaPlayer.setOnErrorListener { mp, what, extra ->
+                preparingId = null
+                playingId = null
+                Toast.makeText(context, "Ошибка плеера ($what/$extra)", Toast.LENGTH_SHORT).show()
+                mp.reset()
+                true
+            }
+            mediaPlayer.prepareAsync()
+        } catch (e: Exception) {
+            preparingId = null
+            playingId = null
+            Toast.makeText(context, "Не удалось проиграть: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Text(
+                        "Forvo · немецкое произношение",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.Black,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Назад",
+                            tint = Color.Black
+                        )
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.White)
+            )
+        },
+        containerColor = Color.White
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .background(Color.White)
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+        ) {
+            HorizontalDivider(color = Color(0xFFEEEEEE), thickness = 1.dp)
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Search row
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = vm.query,
+                    onValueChange = { vm.updateQuery(it) },
+                    placeholder = { Text("Немецкое слово, напр. «Apfel»", color = Color.Gray) },
+                    modifier = Modifier.weight(1f),
+                    singleLine = true,
+                    shape = RoundedCornerShape(24.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedContainerColor = Color.White,
+                        unfocusedContainerColor = Color.White,
+                        focusedBorderColor = Color.Black,
+                        unfocusedBorderColor = Color.LightGray,
+                        focusedTextColor = Color.Black,
+                        unfocusedTextColor = Color.Black
+                    ),
+                    leadingIcon = {
+                        Icon(Icons.Default.Search, contentDescription = null, tint = Color.Gray)
+                    }
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                IconButton(
+                    onClick = { vm.search() },
+                    modifier = Modifier
+                        .size(48.dp)
+                        .background(Color.Black, CircleShape),
+                    enabled = !vm.isLoading
+                ) {
+                    if (vm.isLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            color = Color.White,
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Icon(Icons.Default.Search, contentDescription = "Искать", tint = Color.White)
+                    }
+                }
+            }
+
+            // Hint about API key absence
+            if (vm.apiKey.isBlank()) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Surface(
+                    color = Color(0xFFFFF8E1),
+                    border = BorderStroke(1.dp, Color(0xFFFFE082)),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        "Forvo API-ключ не задан. Вернитесь в чат → шестерёнка → секция «Forvo API».",
+                        color = Color(0xFF8D6E00),
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(12.dp)
+                    )
+                }
+            }
+
+            // Error
+            vm.error?.let { errText ->
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = errText,
+                    color = Color(0xFFC62828),
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(start = 4.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+            HorizontalDivider(color = Color(0xFFF5F5F5), thickness = 1.dp)
+
+            // Results
+            if (vm.results.isEmpty() && !vm.isLoading && vm.error == null) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "Введите слово и нажмите поиск",
+                        color = Color.LightGray,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                    contentPadding = PaddingValues(vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(vm.results, key = { it.id }) { item ->
+                        ForvoItemCard(
+                            item = item,
+                            isPlaying = playingId == item.id,
+                            isPreparing = preparingId == item.id,
+                            onPlay = { playItem(item) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ForvoItemCard(
+    item: ForvoItem,
+    isPlaying: Boolean,
+    isPreparing: Boolean,
+    onPlay: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, Color(0xFFF0F0F0)),
+        color = Color.White
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = item.word,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.Black
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                val sub = buildString {
+                    append("@${item.username}")
+                    item.sex?.takeIf { it.isNotBlank() }?.let { append(" · ").append(it) }
+                    item.country?.takeIf { it.isNotBlank() }?.let { append(" · ").append(it) }
+                }
+                Text(
+                    text = sub,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.Gray,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                val stats = buildString {
+                    item.rate?.let { append("★ $it") }
+                    item.numVotes?.let {
+                        if (isNotEmpty()) append(" · ")
+                        append("голосов: $it")
+                    }
+                    item.hits?.let {
+                        if (isNotEmpty()) append(" · ")
+                        append("прослушано: $it")
+                    }
+                }
+                if (stats.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = stats,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.LightGray,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            IconButton(
+                onClick = onPlay,
+                modifier = Modifier
+                    .size(44.dp)
+                    .background(
+                        if (isPlaying) Color(0xFF1B5E20) else Color.Black,
+                        CircleShape
+                    ),
+                enabled = !isPreparing
+            ) {
+                when {
+                    isPreparing -> CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        color = Color.White,
+                        strokeWidth = 2.dp
+                    )
+                    isPlaying -> Icon(
+                        Icons.Default.VolumeUp,
+                        contentDescription = "Играет",
+                        tint = Color.White
+                    )
+                    else -> Icon(
+                        Icons.Default.PlayArrow,
+                        contentDescription = "Воспроизвести",
+                        tint = Color.White
+                    )
+                }
+            }
+        }
+    }
 }
