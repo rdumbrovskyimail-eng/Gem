@@ -1,0 +1,74 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+          gradle-home-cache-includes: |
+            caches/modules-2
+            caches/jars-9
+            caches/transforms-4
+            caches/build-cache-1
+            wrapper/dists
+            notifications
+          gradle-home-cache-excludes: |
+            caches/[0-9]*.[0-9]*
+            caches/journal-1
+
+      - name: Restore debug keystore
+        run: |
+          mkdir -p ~/.android
+          echo "${{ secrets.DEBUG_KEYSTORE_B64 }}" | base64 -d > ~/.android/debug.keystore
+
+      - name: Build Debug APK
+        run: |
+          gradle assembleDebug \
+            --parallel \
+            --max-workers=4 \
+            -Dorg.gradle.jvmargs="-Xmx4g -XX:+UseG1GC -XX:MaxMetaspaceSize=512m" \
+            -Dorg.gradle.parallel=true \
+            -Dandroid.enableJetifier=false
+
+      - name: Calculate APK Size
+        id: pack
+        run: |
+          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+          APK_SIZE=$(stat -c%s "$APK_PATH")
+          APK_MB=$(awk "BEGIN {printf \"%.1f\", $APK_SIZE / 1048576}")
+          echo "▶ APK Size: ${APK_MB} MB"
+          echo "apk_mb=$APK_MB" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: "v1.0.${{ github.run_number }}"
+          body: |
+            **Commit:** `${{ github.event.head_commit.message }}`
+            **SHA:** `${{ github.sha }}`
+
+            **Gem — клиент Gemini 3.5 Flash**
+            **Размер APK:** ${{ steps.pack.outputs.apk_mb }} MB
+          files: |
+            app/build/outputs/apk/debug/app-debug.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
