@@ -135,7 +135,7 @@ class TranslatorLiveViewModel @Inject constructor(
             .edit().putString(keyApiKey, trimmed).apply()
     }
 
-    fun setMode(newMode: TranslateMode) {
+    fun selectMode(newMode: TranslateMode) {
         mode = newMode
         if (sessionState == SessionState.ACTIVE || sessionState == SessionState.CONNECTING) {
             stopSession()
@@ -583,11 +583,11 @@ fun LiveTranslatorScreen(viewModel: TranslatorLiveViewModel = hiltViewModel()) {
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
-                                    .background(
+                                            .background(
                                         if (isSelected) Color.Black else Color(0xFFF0F0F0),
                                         RoundedCornerShape(12.dp)
                                     )
-                                    .clickable { viewModel.setMode(m) }
+                                    .clickable { viewModel.selectMode(m) }
                                     .padding(vertical = 10.dp),
                                 contentAlignment = Alignment.Center
                             ) {
