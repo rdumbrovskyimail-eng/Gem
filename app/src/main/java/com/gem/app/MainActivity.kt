@@ -8,6 +8,7 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -54,20 +55,26 @@ import dagger.hilt.components.SingletonComponent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import okhttp3.*
-import java.io.IOException
+import org.json.JSONObject
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
 import javax.inject.Singleton
 
 // ====================================================================
-// 1. Состояния сессии
+// 1. Состояния и режимы
 // ====================================================================
-enum class SessionState {
-    IDLE, CONNECTING, ACTIVE, ERROR
+enum class SessionState { IDLE, CONNECTING, ACTIVE, ERROR }
+
+enum class TranslateMode(val label: String) {
+    AUTO("DE \u21C4 RU"),   // двунаправленный авто-режим (две сессии)
+    TO_DE("\u2192 DE"),     // всё переводить на немецкий
+    TO_RU("\u2192 RU")      // всё переводить на русский
 }
 
 // ====================================================================
-// 2. DI-модуль (Предоставление OkHttpClient)
+// 2. DI-модуль
 // ====================================================================
 @Module
 @InstallIn(SingletonComponent::class)
@@ -76,13 +83,14 @@ object AppModule {
     @Singleton
     fun provideOkHttpClient(): OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.MINUTES) // Большой таймаут для длительных сессий
+        .readTimeout(10, TimeUnit.MINUTES)
         .writeTimeout(15, TimeUnit.SECONDS)
+        .pingInterval(20, TimeUnit.SECONDS) // keep-alive для длительных сессий
         .build()
 }
 
 // ====================================================================
-// 3. ViewModel для Live-переводчика
+// 3. ViewModel
 // ====================================================================
 @HiltViewModel
 class TranslatorLiveViewModel @Inject constructor(
@@ -91,7 +99,7 @@ class TranslatorLiveViewModel @Inject constructor(
 
     var apiKey by mutableStateOf("")
         private set
-    var targetLanguage by mutableStateOf("de") // BCP-47 код целевого языка. "de" - немецкий, "ru" - русский
+    var mode by mutableStateOf(TranslateMode.AUTO)
         private set
     var sessionState by mutableStateOf(SessionState.IDLE)
         private set
@@ -105,7 +113,13 @@ class TranslatorLiveViewModel @Inject constructor(
     private val prefsName = "translator_live_prefs"
     private val keyApiKey = "api_key"
 
-    private var webSocket: WebSocket? = null
+    // В AUTO-режиме открываются ДВЕ сессии: target=ru и target=de.
+    // echoTargetLanguage=false => сессия молчит, если речь уже на её целевом языке.
+    // Немецкая речь озвучивается ru-сессией, русская — de-сессией.
+    private val sockets = CopyOnWriteArrayList<WebSocket>()
+    private val readyCount = AtomicInteger(0)
+    private var expectedSessions = 1
+
     private var audioRecorder: AudioRecorder? = null
     private var audioPlayer: AudioPlayer? = null
 
@@ -118,15 +132,12 @@ class TranslatorLiveViewModel @Inject constructor(
         val trimmed = key.trim()
         apiKey = trimmed
         context.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
-            .edit()
-            .putString(keyApiKey, trimmed)
-            .apply()
+            .edit().putString(keyApiKey, trimmed).apply()
     }
 
-    fun setTargetLang(lang: String) {
-        targetLanguage = lang
-        // Если сессия была активна, перезапускаем с новыми настройками
-        if (sessionState == SessionState.ACTIVE) {
+    fun setMode(newMode: TranslateMode) {
+        mode = newMode
+        if (sessionState == SessionState.ACTIVE || sessionState == SessionState.CONNECTING) {
             stopSession()
             startLiveSession()
         }
@@ -143,53 +154,69 @@ class TranslatorLiveViewModel @Inject constructor(
         errorMsg = null
         inputTranscript = ""
         outputTranscript = ""
+        readyCount.set(0)
 
-        // Инициализируем плеер для воспроизведения переведенного аудио
-        audioPlayer = AudioPlayer()
-        audioPlayer?.start()
+        audioPlayer = AudioPlayer().also { it.start() }
 
-        // Создаем подключение к WebSocket API Gemini Live (используется v1beta)
-        val url = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
+        when (mode) {
+            TranslateMode.AUTO -> {
+                expectedSessions = 2
+                // primary-сессия (ru) отвечает за input-субтитры, чтобы не дублировать текст
+                openTranslationSocket(target = "ru", isPrimary = true)
+                openTranslationSocket(target = "de", isPrimary = false)
+            }
+            TranslateMode.TO_DE -> {
+                expectedSessions = 1
+                openTranslationSocket(target = "de", isPrimary = true)
+            }
+            TranslateMode.TO_RU -> {
+                expectedSessions = 1
+                openTranslationSocket(target = "ru", isPrimary = true)
+            }
+        }
+    }
+
+    private fun openTranslationSocket(target: String, isPrimary: Boolean) {
+        val url = "wss://generativelanguage.googleapis.com/ws/" +
+            "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
         val request = Request.Builder().url(url).build()
 
-        webSocket = client.newWebSocket(request, object : WebSocketListener() {
+        val socket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                viewModelScope.launch(Dispatchers.Main) {
-                    sessionState = SessionState.ACTIVE
-                    
-                    // 1. Отправляем первоначальный конфигурационный JSON для Live Translate
-                    val setupJson = """
-                        {
-                          "setup": {
-                            "model": "models/gemini-3.5-live-translate-preview",
-                            "inputAudioTranscription": {},
-                            "outputAudioTranscription": {},
-                            "generationConfig": {
-                              "responseModalities": ["AUDIO"],
-                              "translationConfig": {
-                                "targetLanguageCode": "$targetLanguage",
-                                "echoTargetLanguage": true
-                              }
-                            }
+                // ВАЖНО: для gemini-3.5-live-translate-preview транскрипции
+                // лежат ВНУТРИ generationConfig (в отличие от обычного Live API)
+                val setupJson = """
+                    {
+                      "setup": {
+                        "model": "models/gemini-3.5-live-translate-preview",
+                        "generationConfig": {
+                          "responseModalities": ["AUDIO"],
+                          "inputAudioTranscription": {},
+                          "outputAudioTranscription": {},
+                          "translationConfig": {
+                            "targetLanguageCode": "$target",
+                            "echoTargetLanguage": false
                           }
                         }
-                    """.trimIndent()
-                    webSocket.send(setupJson)
-
-                    // 2. Начинаем запись микрофона
-                    startRecording()
-                }
+                      }
+                    }
+                """.trimIndent()
+                webSocket.send(setupJson)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                viewModelScope.launch(Dispatchers.Main) {
-                    parseServerResponse(text)
-                }
+                handleServerMessage(text, isPrimary)
+            }
+
+            override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
+                // Сервер может слать сообщения бинарными фреймами
+                handleServerMessage(bytes.utf8(), isPrimary)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 viewModelScope.launch(Dispatchers.Main) {
-                    errorMsg = "Ошибка: ${t.localizedMessage ?: "Сбой подключения"}"
+                    val httpInfo = response?.let { " (HTTP ${it.code})" } ?: ""
+                    errorMsg = "Ошибка: ${t.localizedMessage ?: "Сбой подключения"}$httpInfo"
                     sessionState = SessionState.ERROR
                     stopSession()
                 }
@@ -197,83 +224,88 @@ class TranslatorLiveViewModel @Inject constructor(
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 viewModelScope.launch(Dispatchers.Main) {
-                    sessionState = SessionState.IDLE
-                    stopSession()
+                    if (code != 1000 && reason.isNotBlank()) {
+                        errorMsg = "Сессия закрыта: $reason"
+                        sessionState = SessionState.ERROR
+                    }
+                    webSocket.close(1000, null)
                 }
             }
         })
+        sockets.add(socket)
     }
 
-    private fun startRecording() {
-        audioRecorder = AudioRecorder { pcmChunk ->
-            val base64 = android.util.Base64.encodeToString(pcmChunk, android.util.Base64.NO_WRAP)
-            val jsonMsg = """
-                {
-                  "realtimeInput": {
-                    "mediaChunks": [
-                      {
-                        "mimeType": "audio/pcm",
-                        "data": "$base64"
-                      }
-                    ]
-                  }
-                }
-            """.trimIndent()
-            webSocket?.send(jsonMsg)
-        }
-        audioRecorder?.start()
-    }
-
-    private fun parseServerResponse(jsonText: String) {
+    private fun handleServerMessage(jsonText: String, isPrimary: Boolean) {
         try {
-            val root = org.json.JSONObject(jsonText)
-            if (root.has("serverContent")) {
-                val serverContent = root.getJSONObject("serverContent")
+            val root = JSONObject(jsonText)
 
-                // 1. Получаем аудио-ответ от модели и пишем его в плеер
-                if (serverContent.has("modelTurn")) {
-                    val modelTurn = serverContent.getJSONObject("modelTurn")
-                    if (modelTurn.has("parts")) {
-                        val parts = modelTurn.getJSONArray("parts")
-                        for (i in 0 until parts.length()) {
-                            val part = parts.getJSONObject(i)
-                            if (part.has("inlineData")) {
-                                val inlineData = part.getJSONObject("inlineData")
-                                if (inlineData.has("data")) {
-                                    val b64 = inlineData.getString("data")
-                                    val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
-                                    audioPlayer?.write(bytes)
-                                }
-                            }
-                        }
+            // Сервер подтверждает setup; начинаем запись, когда готовы все сессии
+            if (root.has("setupComplete")) {
+                val ready = readyCount.incrementAndGet()
+                if (ready >= expectedSessions) {
+                    viewModelScope.launch(Dispatchers.Main) {
+                        sessionState = SessionState.ACTIVE
+                        startRecording()
                     }
                 }
+                return
+            }
 
-                // 2. Получаем оригинальные субтитры (то, что сказали вы)
-                if (serverContent.has("inputTranscription")) {
-                    val transcript = serverContent.getJSONObject("inputTranscription")
-                    if (transcript.has("text")) {
-                        val newText = transcript.getString("text")
-                        if (newText.isNotBlank()) {
-                            inputTranscript += " $newText"
-                        }
+            if (!root.has("serverContent")) return
+            val serverContent = root.getJSONObject("serverContent")
+
+            // 1. Переведённое аудио -> сразу в плеер (без переключения потоков, ради задержки)
+            serverContent.optJSONObject("modelTurn")?.optJSONArray("parts")?.let { parts ->
+                for (i in 0 until parts.length()) {
+                    val inline = parts.getJSONObject(i).optJSONObject("inlineData") ?: continue
+                    val b64 = inline.optString("data", "")
+                    if (b64.isNotEmpty()) {
+                        val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+                        audioPlayer?.write(bytes)
                     }
                 }
+            }
 
-                // 3. Получаем переведенные субтитры (то, что говорит переводчик)
-                if (serverContent.has("outputTranscription")) {
-                    val transcript = serverContent.getJSONObject("outputTranscription")
-                    if (transcript.has("text")) {
-                        val newText = transcript.getString("text")
-                        if (newText.isNotBlank()) {
-                            outputTranscript += " $newText"
-                        }
+            // 2. Транскрипт входной речи — только от primary-сессии (иначе дубли в AUTO)
+            if (isPrimary) {
+                serverContent.optJSONObject("inputTranscription")?.let { tr ->
+                    val newText = tr.optString("text", "")
+                    if (newText.isNotBlank()) {
+                        viewModelScope.launch(Dispatchers.Main) { inputTranscript += newText }
                     }
+                }
+            }
+
+            // 3. Транскрипт перевода — от любой сессии (молчащая ничего не присылает)
+            serverContent.optJSONObject("outputTranscription")?.let { tr ->
+                val newText = tr.optString("text", "")
+                if (newText.isNotBlank()) {
+                    viewModelScope.launch(Dispatchers.Main) { outputTranscript += newText }
                 }
             }
         } catch (e: Exception) {
             e.printStackTrace()
         }
+    }
+
+    private fun startRecording() {
+        if (audioRecorder != null) return
+        audioRecorder = AudioRecorder { pcmChunk ->
+            val base64 = android.util.Base64.encodeToString(pcmChunk, android.util.Base64.NO_WRAP)
+            // Новый формат realtimeInput: поле "audio" + mimeType с указанием rate
+            val jsonMsg = """
+                {
+                  "realtimeInput": {
+                    "audio": {
+                      "mimeType": "audio/pcm;rate=16000",
+                      "data": "$base64"
+                    }
+                  }
+                }
+            """.trimIndent()
+            sockets.forEach { it.send(jsonMsg) }
+        }
+        audioRecorder?.start()
     }
 
     fun stopSession() {
@@ -283,8 +315,9 @@ class TranslatorLiveViewModel @Inject constructor(
         audioPlayer?.stop()
         audioPlayer = null
 
-        webSocket?.close(1000, "User stopped")
-        webSocket = null
+        sockets.forEach { runCatching { it.close(1000, "User stopped") } }
+        sockets.clear()
+        readyCount.set(0)
 
         if (sessionState != SessionState.ERROR) {
             sessionState = SessionState.IDLE
@@ -298,34 +331,45 @@ class TranslatorLiveViewModel @Inject constructor(
 }
 
 // ====================================================================
-// 4. Компоненты аудио захвата и воспроизведения
+// 4. Аудио: захват и воспроизведение
 // ====================================================================
 
 class AudioRecorder(private val onAudioChunk: (ByteArray) -> Unit) {
     private var audioRecord: AudioRecord? = null
-    private var isRecording = false
+    private var echoCanceler: AcousticEchoCanceler? = null
+    @Volatile private var isRecording = false
     private var recordingThread: Thread? = null
 
     fun start() {
-        val sampleRate = 16000 // Для Gemini Live API требуется 16 кГц
+        val sampleRate = 16000 // Вход: raw 16-bit PCM, 16 кГц, моно
         val channelConfig = AudioFormat.CHANNEL_IN_MONO
         val audioFormat = AudioFormat.ENCODING_PCM_16BIT
-        val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+        val minBuf = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
 
         try {
+            // VOICE_COMMUNICATION включает аппаратное эхоподавление (AEC):
+            // без него динамик с переводом "слышен" микрофону и в AUTO-режиме
+            // вторая сессия начинает переводить собственный перевод по кругу
             audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 sampleRate,
                 channelConfig,
                 audioFormat,
-                bufferSize
+                maxOf(minBuf, 3200 * 2)
             )
+
+            audioRecord?.audioSessionId?.let { sid ->
+                if (AcousticEchoCanceler.isAvailable()) {
+                    echoCanceler = AcousticEchoCanceler.create(sid)?.apply { enabled = true }
+                }
+            }
 
             isRecording = true
             audioRecord?.startRecording()
 
             recordingThread = Thread {
-                val buffer = ByteArray(1600) // Отправка кусочками ~50 мс для минимизации задержки
+                // Чанки по 100 мс, как требует документация: 16000 Гц * 2 байта * 0.1 с
+                val buffer = ByteArray(3200)
                 while (isRecording) {
                     val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
                     if (read > 0) {
@@ -342,9 +386,11 @@ class AudioRecorder(private val onAudioChunk: (ByteArray) -> Unit) {
     fun stop() {
         isRecording = false
         try {
+            echoCanceler?.release()
             audioRecord?.stop()
             audioRecord?.release()
         } catch (_: Exception) {}
+        echoCanceler = null
         audioRecord = null
         recordingThread = null
     }
@@ -354,7 +400,7 @@ class AudioPlayer {
     private var audioTrack: AudioTrack? = null
 
     fun start() {
-        val sampleRate = 24000 // Аудиовыход от модели идет на частоте 24 кГц
+        val sampleRate = 24000 // Выход модели: 24 кГц PCM
         val channelConfig = AudioFormat.CHANNEL_OUT_MONO
         val audioFormat = AudioFormat.ENCODING_PCM_16BIT
         val minBufferSize = AudioTrack.getMinBufferSize(sampleRate, channelConfig, audioFormat)
@@ -362,7 +408,9 @@ class AudioPlayer {
         audioTrack = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    // VOICE_COMMUNICATION направляет звук в "голосовой" тракт,
+                    // где работает системное эхоподавление
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )
@@ -373,13 +421,14 @@ class AudioPlayer {
                     .setChannelMask(channelConfig)
                     .build()
             )
-            .setBufferSizeInBytes(minBufferSize)
+            .setBufferSizeInBytes(minBufferSize * 2)
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
         audioTrack?.play()
     }
 
+    @Synchronized
     fun write(pcmData: ByteArray) {
         audioTrack?.write(pcmData, 0, pcmData.size)
     }
@@ -394,7 +443,7 @@ class AudioPlayer {
 }
 
 // ====================================================================
-// 5. Интерфейс Live-Переводчика
+// 5. Интерфейс
 // ====================================================================
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -402,21 +451,16 @@ class AudioPlayer {
 fun LiveTranslatorScreen(viewModel: TranslatorLiveViewModel = hiltViewModel()) {
     val context = LocalContext.current
 
-    LaunchedEffect(Unit) {
-        viewModel.init(context)
-    }
+    LaunchedEffect(Unit) { viewModel.init(context) }
 
     var showKeyInput by remember { mutableStateOf(viewModel.apiKey.isBlank()) }
     var keyInputValue by remember { mutableStateOf(viewModel.apiKey) }
 
     LaunchedEffect(viewModel.apiKey) {
         keyInputValue = viewModel.apiKey
-        if (viewModel.apiKey.isNotBlank()) {
-            showKeyInput = false
-        }
+        if (viewModel.apiKey.isNotBlank()) showKeyInput = false
     }
 
-    // Запрос разрешений для записи микрофона
     val requestPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { isGranted ->
@@ -432,7 +476,7 @@ fun LiveTranslatorScreen(viewModel: TranslatorLiveViewModel = hiltViewModel()) {
             TopAppBar(
                 title = {
                     Text(
-                        "Gemini 3.5 Live Translate",
+                        "Live Translate DE \u21C4 RU",
                         fontWeight = FontWeight.Bold,
                         style = MaterialTheme.typography.titleMedium,
                         color = Color.Black
@@ -459,7 +503,6 @@ fun LiveTranslatorScreen(viewModel: TranslatorLiveViewModel = hiltViewModel()) {
                 .padding(horizontal = 16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Секция настройки ключа
             AnimatedVisibility(visible = showKeyInput) {
                 Card(
                     modifier = Modifier
@@ -516,7 +559,7 @@ fun LiveTranslatorScreen(viewModel: TranslatorLiveViewModel = hiltViewModel()) {
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // Панель выбора целевого языка
+            // Выбор режима перевода
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = Color.White),
@@ -525,7 +568,7 @@ fun LiveTranslatorScreen(viewModel: TranslatorLiveViewModel = hiltViewModel()) {
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        "Язык перевода (Куда переводить)",
+                        "Режим перевода",
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.Bold,
                         color = Color.Gray
@@ -535,9 +578,8 @@ fun LiveTranslatorScreen(viewModel: TranslatorLiveViewModel = hiltViewModel()) {
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        val languages = listOf("de" to "Немецкий (DE)", "ru" to "Русский (RU)", "en" to "Английский (EN)")
-                        languages.forEach { (code, name) ->
-                            val isSelected = viewModel.targetLanguage == code
+                        TranslateMode.entries.forEach { m ->
+                            val isSelected = viewModel.mode == m
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
@@ -545,12 +587,12 @@ fun LiveTranslatorScreen(viewModel: TranslatorLiveViewModel = hiltViewModel()) {
                                         if (isSelected) Color.Black else Color(0xFFF0F0F0),
                                         RoundedCornerShape(12.dp)
                                     )
-                                    .clickable { viewModel.setTargetLang(code) }
+                                    .clickable { viewModel.setMode(m) }
                                     .padding(vertical = 10.dp),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
-                                    name,
+                                    m.label,
                                     color = if (isSelected) Color.White else Color.Gray,
                                     fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
                                     style = MaterialTheme.typography.bodyMedium
@@ -558,10 +600,18 @@ fun LiveTranslatorScreen(viewModel: TranslatorLiveViewModel = hiltViewModel()) {
                             }
                         }
                     }
+                    if (viewModel.mode == TranslateMode.AUTO) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            "Авто: немецкая речь озвучивается по-русски, русская — по-немецки.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color.Gray
+                        )
+                    }
                 }
             }
 
-            // Интерактивная зона стриминга
+            // Зона управления
             Box(
                 modifier = Modifier
                     .weight(1.2f)
@@ -575,7 +625,6 @@ fun LiveTranslatorScreen(viewModel: TranslatorLiveViewModel = hiltViewModel()) {
                         contentAlignment = Alignment.Center,
                         modifier = Modifier.size(160.dp)
                     ) {
-                        // Анимация пульсации во время активного перевода
                         if (state == SessionState.ACTIVE) {
                             val infiniteTransition = rememberInfiniteTransition()
                             val scale by infiniteTransition.animateFloat(
@@ -600,7 +649,9 @@ fun LiveTranslatorScreen(viewModel: TranslatorLiveViewModel = hiltViewModel()) {
                                 if (state == SessionState.ACTIVE || state == SessionState.CONNECTING) {
                                     viewModel.stopSession()
                                 } else {
-                                    val permissionCheck = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+                                    val permissionCheck = ContextCompat.checkSelfPermission(
+                                        context, Manifest.permission.RECORD_AUDIO
+                                    )
                                     if (permissionCheck == PackageManager.PERMISSION_GRANTED) {
                                         viewModel.startLiveSession()
                                     } else {
@@ -659,7 +710,7 @@ fun LiveTranslatorScreen(viewModel: TranslatorLiveViewModel = hiltViewModel()) {
                 }
             }
 
-            // Субтитры в реальном времени
+            // Субтитры
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -707,7 +758,7 @@ fun LiveTranslatorScreen(viewModel: TranslatorLiveViewModel = hiltViewModel()) {
                         if (viewModel.inputTranscript.isNotBlank()) {
                             Column {
                                 Text(
-                                    "Вы говорите:",
+                                    "Распознанная речь:",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = Color.Gray,
                                     fontWeight = FontWeight.Bold
@@ -724,7 +775,7 @@ fun LiveTranslatorScreen(viewModel: TranslatorLiveViewModel = hiltViewModel()) {
                         if (viewModel.outputTranscript.isNotBlank()) {
                             Column {
                                 Text(
-                                    "Перевод (${viewModel.targetLanguage.uppercase()}):",
+                                    "Перевод:",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = Color(0xFF4CAF50),
                                     fontWeight = FontWeight.Bold
@@ -761,7 +812,7 @@ fun LiveTranslatorScreen(viewModel: TranslatorLiveViewModel = hiltViewModel()) {
 }
 
 // ====================================================================
-// 6. Точка входа в Activity
+// 6. Activity
 // ====================================================================
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
